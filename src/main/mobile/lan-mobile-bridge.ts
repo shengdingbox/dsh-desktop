@@ -122,6 +122,7 @@ export interface LanMobileBridgeSnapshot {
   tunnelUrl?: string
   tunnelProvider?: InternetTunnelProvider
   tunnelError?: string
+  universalToken?: string | null
 }
 
 interface MobileSession {
@@ -197,6 +198,8 @@ export class LanMobileBridge {
   private lastConnected = false
   private readonly desktopSessionToken = randomBytes(32).toString('base64url')
   private desktopBootstrapToken?: string
+  /** Universal pairing token: never expires, no PIN required. */
+  private universalToken?: string
 
   constructor(private readonly options: LanMobileBridgeOptions) {
     this.now = options.now ?? Date.now
@@ -436,7 +439,8 @@ export class LanMobileBridge {
       tunnelLoading: this.tunnelLoading,
       tunnelUrl: this.tunnelInstance?.url,
       tunnelProvider: this.tunnelInstance?.provider,
-      tunnelError: this.tunnelError
+      tunnelError: this.tunnelError,
+      universalToken: this.universalToken ?? null
     }
   }
 
@@ -641,6 +645,7 @@ export class LanMobileBridge {
       expiresAt: snapshot.expiresAt,
       unexpectedlyClosed: this.unexpectedlyClosed,
       tunnelExpiresAt: this.tunnelExpiresAt,
+      universalToken: snapshot.universalToken ?? null,
       ...this.desktopPinFields()
     }
   }
@@ -736,7 +741,8 @@ export class LanMobileBridge {
           pairingPin: pin.pairingPin,
           pinConsent: pin.pinConsent,
           pinExpiresAt: pin.pinExpiresAt,
-          tunnelExpiresAt: this.tunnelExpiresAt
+          tunnelExpiresAt: this.tunnelExpiresAt,
+          universalToken: snapshot.universalToken ?? null
         })
       )
     }
@@ -899,6 +905,34 @@ export class LanMobileBridge {
       return this.json(response, 200, { ok: true })
     }
 
+    if (request.method === 'POST' && url.pathname === '/desktop/universal-token') {
+      if (this.rejectUnlessDesktop(request, transportAddress, response)) return
+      this.verifySameOrigin(request)
+      let body: { token?: unknown }
+      try {
+        body = JSON.parse(await readBody(request)) as { token?: unknown }
+      } catch {
+        body = {}
+      }
+      const token = typeof body.token === 'string' ? body.token.trim() : ''
+      if (!token) {
+        // Clear the universal token.
+        this.universalToken = undefined
+        return this.json(response, 200, { ok: true, universalToken: null })
+      }
+      // Validate token format: base64url-like, reasonable length.
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) {
+        return this.json(response, 400, { ok: false, error: 'Token must be 8-128 characters of A-Z, a-z, 0-9, -, _' })
+      }
+      this.universalToken = token
+      return this.json(response, 200, { ok: true, universalToken: token })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/desktop/universal-token') {
+      if (this.rejectUnlessDesktop(request, transportAddress, response)) return
+      return this.json(response, 200, { universalToken: this.universalToken ?? null })
+    }
+
     if (request.method === 'GET' && url.pathname === '/disconnected') {
       const migrationUrl = this.tunnelMigrationUrl(url, connectionMode)
       if (migrationUrl) return this.redirect(response, migrationUrl)
@@ -939,11 +973,14 @@ export class LanMobileBridge {
         response.end()
         return
       }
-      if (!this.validPairingToken(url.searchParams.get('token'))) {
+      const tokenParam = url.searchParams.get('token')
+      if (!this.validPairingToken(tokenParam)) {
         return this.text(response, 401, 'This pairing link is invalid or expired.')
       }
-      if (connectionMode === 'lan') {
-        this.issueSessionCookie(request, response, remoteAddress, 'lan')
+      // Universal token: skip PIN verification, issue session directly.
+      const isUniversal = this.universalToken && this.timingSafeStringEqual(tokenParam ?? '', this.universalToken)
+      if (connectionMode === 'lan' || isUniversal) {
+        this.issueSessionCookie(request, response, remoteAddress, connectionMode)
         response.statusCode = 302
         response.setHeader('location', '/')
         response.end()
@@ -1063,10 +1100,17 @@ export class LanMobileBridge {
   }
 
   private validPairingToken(candidate: string | null): boolean {
-    if (!candidate || !this.pairingToken || !this.pairingExpiresAt) return false
+    if (!candidate) return false
+    // Universal token: never expires, no PIN required.
+    if (this.universalToken && this.timingSafeStringEqual(candidate, this.universalToken)) return true
+    if (!this.pairingToken || !this.pairingExpiresAt) return false
     if (this.now() > this.pairingExpiresAt) return false
-    const left = Buffer.from(candidate)
-    const right = Buffer.from(this.pairingToken)
+    return this.timingSafeStringEqual(candidate, this.pairingToken)
+  }
+
+  private timingSafeStringEqual(a: string, b: string): boolean {
+    const left = Buffer.from(a)
+    const right = Buffer.from(b)
     return left.length === right.length && timingSafeEqual(left, right)
   }
 
