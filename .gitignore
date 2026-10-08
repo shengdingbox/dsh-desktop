@@ -34,3 +34,5 @@ docs/mobile-connection-latency.zh.md
 /.build/
 /packages/ppt-runtime/templates/
 /packages/ppt-bundles/
+/.npm-cache/
+/.idea/
