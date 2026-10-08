@@ -36,3 +36,4 @@ docs/mobile-connection-latency.zh.md
 /packages/ppt-bundles/
 /.npm-cache/
 /.idea/
+/tools/harness-proxy/.go-cache/
