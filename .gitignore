@@ -31,3 +31,5 @@ docs/mobile-connection-latency.zh.md
 
 # Local pnpm content store
 /.pnpm-store/
+/.npm-cache/
+/.idea/

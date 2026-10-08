@@ -37,13 +37,15 @@ import {
 import {
   demoteMarketGeneration,
   ensureMarketBaseline,
+  marketUsableWithoutBaseline,
   readProfileMarket
 } from './state/market-baseline'
 import {
   clearProfileInstallMarker,
   markProfileInstallComplete
 } from './state/profile-install-marker'
-import { healProfileBundles, inspectProfileConsistency } from './state/profile-consistency'
+import { healProfileBundles, HOST_COMPOSED_PPT_BUNDLES, inspectProfileConsistency } from './state/profile-consistency'
+import { inspectProfileBootInputs } from './state/profile-boot-preflight'
 import {
   disableProfilePlugin,
   enableProfilePlugin,
@@ -58,6 +60,10 @@ import {
 } from './state/profile-compatibility'
 import { ensureStoreDirPinned, inspectStoreConsistency } from './state/profile-store'
 import { LanMobileBridge } from './mobile/lan-mobile-bridge'
+import { createFilePairingPinStore, pairingPinStorePath } from './mobile/pairing-pin-store'
+import { createFileUniversalTokenStore, universalTokenStorePath } from './mobile/universal-token-store'
+import { RemoteHarnessManager } from './remote-harness-manager'
+import type { RemoteWorkspace } from './remote-harness-manager'
 import {
   detectPluginRecovery,
   PLUGIN_RECOVERY_EVIDENCE_TIMEOUT_MS
@@ -76,10 +82,12 @@ import {
   serializeGpuFallbackState
 } from './gpu-fallback'
 import { secureWindow } from './security'
-import { SafeModeOverlay } from './safe-mode-overlay'
+import { SafeModeFrame } from './safe-mode-frame'
+import { desktopResourceUrl, installDesktopProtocol, registerDesktopScheme, SAFE_MODE_PAGE } from './desktop-protocol'
 import { ensureLaunchRoot } from './state/launch-root'
 import {
   listInstalledProfilePlugins,
+  pruneUnresolvableProfileBundles,
   resetPluginProfile
 } from './state/plugin-recovery'
 import { ensureSafeModeProfile, SAFE_MODE_PROFILE } from './state/safe-mode-profile'
@@ -96,6 +104,7 @@ import {
   recoverInterruptedMigration,
   rollBackMigration
 } from './state/generation-migration'
+import { migrateUserPresetPersonaPrefixes } from './state/persona-prefix-migration'
 import { runProfileStartupMaintenance } from './state/profile-startup-maintenance'
 import { cleanupPluginOwnedComponents } from './state/plugin-component-cleanup'
 import {
@@ -210,8 +219,11 @@ let desktopStorageManager: DesktopStorageManager | undefined
 let windowStateManager: WindowStateManager | undefined
 let mobileBridge: LanMobileBridge
 let repairAgentService: RepairAgentService | undefined
+let remoteHarnessManager: RemoteHarnessManager | undefined
 /** A repair prompt from the Recovery page, started by the Safe Mode page load. */
 let pendingRepairPrompt: string | undefined
+/** A Safe Mode reason raised while its manager was already open. */
+let pendingSafeModeNotice: string | undefined
 /** Why the last Repair Agent session could not open, until it is shown once. */
 let repairAgentLaunchError: string | undefined
 /** Desktop storage key the Harness UI restores its selected session from. */
@@ -234,7 +246,11 @@ let pendingFrontendPluginRecovery = false
 let pendingFrontendPluginRecoveryMessage: string | undefined
 let safeModeVisible = false
 let safeModeManagerVisible = false
-let safeModeManager: SafeModeOverlay | undefined
+let safeModeManager: SafeModeFrame | undefined
+/** Distinguishes consecutive Safe Mode page loads, so an unchanged view model still reloads the frame. */
+let safeModeLoadSequence = 0
+/** An unreachable registry is not asked again for this long, so reopening the Safe Mode page stays instant. */
+const SAFE_MODE_MARKET_FAILURE_TTL_MS = 60_000
 let safeModeActionResolver: ((action: SafeModeAction) => void) | undefined
 let migrationRecoveryLocked = false
 let maintenanceRecoveryLocked = false
@@ -1266,17 +1282,18 @@ async function showSplash(): Promise<void> {
 }
 
 /**
- * Name what the profile contradicts about itself without changing it. A
- * dangling declaration does not throw — it leaves a service waiting on a
- * provider that never arrives — so without this the profile reads as a slow
- * start and the fault is found by reading logs for an afternoon. Reporting
- * only: startup never repairs or prunes the normal Profile automatically.
+ * Reconcile bundle declarations, including the PPT layers already owned by
+ * Desktop, then report remaining inconsistencies. This never removes package
+ * files, user patch rows or plugin data, and runs while Harness is stopped.
  */
 async function reportProfileConsistency(dshHome: string): Promise<void> {
   try {
-    const healed = await healProfileBundles(dshHome)
-    if (healed.length > 0) {
-      runtime.note(`[desktop] auto-composed ${healed.length} missing bundle(s): ${healed.join(', ')}`)
+    const healed = await healProfileBundles(dshHome, HOST_COMPOSED_PPT_BUNDLES)
+    if (healed.removed.length > 0) {
+      runtime.note(`[desktop] removed duplicate host-composed PPT bundle layer(s): ${healed.removed.join(', ')}; packages and user patches kept`)
+    }
+    if (healed.added.length > 0) {
+      runtime.note(`[desktop] auto-composed ${healed.added.length} missing bundle(s): ${healed.added.join(', ')}`)
     }
   } catch (error) {
     runtime.note(
@@ -1289,7 +1306,7 @@ async function reportProfileConsistency(dshHome: string): Promise<void> {
   // Defer heavy recursive inspections of the profiles directory and package store
   // so they run asynchronously without blocking the startup launch pipeline.
   void Promise.all([
-    inspectProfileConsistency(dshHome),
+    inspectProfileConsistency(dshHome, HOST_COMPOSED_PPT_BUNDLES),
     inspectStoreConsistency(dshHome)
   ])
     .then(([findings, store]) => {
@@ -1389,27 +1406,55 @@ async function canRetryLockedPluginRestore(dshHome: string, removalId: string): 
   }
 }
 
+/** User presets are outside the profile journal, so this runs on every start path. */
+async function migratePersonaPrefixesBeforeStart(dshHome: string): Promise<void> {
+  try {
+    await migrateUserPresetPersonaPrefixes(dshHome, (line) => runtime.note(line))
+  } catch (error) {
+    runtime.note(
+      `[desktop] persona prefix migration failed: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+}
+
 async function enterMigrationSafeRecovery(
   dshHome: string,
   reason: string,
-  allowedRestoreId?: string
+  allowedRestoreId?: string,
+  repairable = false,
+  repairTarget?: string
 ): Promise<void> {
   if (failureRecoveryVisible) resolvePluginRecoveryAction('safe-mode')
   safeModeVisible = true
-  maintenanceRecoveryLocked = true
+  maintenanceRecoveryLocked = !repairable
   maintenanceAllowedRestoreId = allowedRestoreId
+  // Surface the bundle the preflight named in the plugin list, so the user acts
+  // on that plugin instead of reading the reason and guessing.
+  if (repairTarget !== undefined) {
+    safeModeSuspectedPlugins = [...new Set([...safeModeSuspectedPlugins, repairTarget])]
+  }
   await refreshMigrationRecoveryLock(dshHome)
   runtime.note(`[desktop] Profile recovery requires Safe Mode: ${reason}`)
   await runtime.stop()
   await ensureSafeModeProfile(dshHome)
-  runtime.note('[desktop] safe mode: normal Profile maintenance is blocked until recovery succeeds')
+  runtime.note(repairable
+    ? '[desktop] safe mode: normal Profile startup failed preflight; plugin repair remains available'
+    : '[desktop] safe mode: normal Profile maintenance is blocked until recovery succeeds')
+  await migratePersonaPrefixesBeforeStart(dshHome)
   await runtime.start(launchDirectory, SAFE_MODE_PROFILE)
-  if (runtime.snapshot().phase !== 'ready') return
-
-  void mobileBridge.start().catch(showUnexpectedError)
-  const notice = harnessLocale() === 'zh'
+  if (runtime.snapshot().phase === 'ready') void mobileBridge.start().catch(showUnexpectedError)
+  // The native manager remains usable even if shared settings prevent the
+  // recovery Harness from starting; it does not depend on its Web UI.
+  const notice = repairable
+    ? (harnessLocale() === 'zh'
+        ? `正常 Profile 启动检查未通过，已进入安全模式。可以在此修复插件后重试。${reason}`
+        : `Normal Profile startup checks failed. Safe Mode is available to repair plugins and retry. ${reason}`)
+    : harnessLocale() === 'zh'
     ? `正常 Profile 恢复尚未完成，已停止所有自动修复并进入安全模式。恢复材料仍保留。${reason}`
     : `Normal Profile recovery is incomplete. Automatic maintenance is blocked and recovery material is preserved. ${reason}`
+  // A manager already on screen suppresses the queued one below, so the reason
+  // is parked where that manager's action loop can pick it up instead.
+  pendingSafeModeNotice = notice
   queueMicrotask(() => {
     void showSafeModeManager({ notice, noticeTone: 'error' }).catch(showUnexpectedError)
   })
@@ -1475,7 +1520,10 @@ function launchHarness(): Promise<void> {
         pnpmRunnerPath: bundledPnpmRunnerPath(),
         note: (line) => runtime.note(line)
       }),
-      reportProfileConsistency: () => reportProfileConsistency(dshHome)
+      marketUsableWithoutBaseline: () => marketUsableWithoutBaseline(dshHome),
+      reportProfileConsistency: () => reportProfileConsistency(dshHome),
+      inspectProfileBootInputs: () => inspectProfileBootInputs(dshHome, dshEntryPath()),
+      pruneUnresolvableBundles: () => pruneUnresolvableProfileBundles(dshHome)
     })
     migrationPendingPlugins = new Set(
       maintenance.outcome === 'normal-profile' && maintenance.migration.outcome === 'deferred-failure'
@@ -1486,7 +1534,9 @@ function launchHarness(): Promise<void> {
       await enterMigrationSafeRecovery(
         dshHome,
         maintenance.reason,
-        maintenance.allowedRestoreId
+        maintenance.allowedRestoreId,
+        maintenance.repairable,
+        maintenance.repairTarget
       )
       return
     }
@@ -1506,6 +1556,7 @@ function launchHarness(): Promise<void> {
         )
       })
     desktopStorageManager?.switchProfile(join(dshHome, 'profiles', 'web'))
+    await migratePersonaPrefixesBeforeStart(dshHome)
     await runtime.start(launchDirectory)
 
     // A failed launch must not rewrite the user's enabled plugin set. Recovery
@@ -1550,6 +1601,7 @@ function launchSafeHarness(): Promise<void> {
     await ensureSafeModeProfile(dshHome)
     runtime.note('[desktop] safe mode: third-party web profile bundles are blocked')
     desktopStorageManager?.switchProfile(join(dshHome, 'profiles', SAFE_MODE_PROFILE))
+    await migratePersonaPrefixesBeforeStart(dshHome)
     await runtime.start(launchDirectory, SAFE_MODE_PROFILE)
     if (runtime.snapshot().phase === 'ready') {
       void mobileBridge.start().catch(showUnexpectedError)
@@ -1841,13 +1893,15 @@ function assertTrustedMainWindowEvent(event: IpcMainInvokeEvent): void {
   }
 }
 
+/**
+ * The Safe Mode page is framed inside the Harness page and reaches the main
+ * process through the host page's preload, which relays only messages from
+ * that frame. So a trusted event comes from the host window's main frame
+ * while the manager is up.
+ */
 function assertTrustedSafeModeManagerEvent(event: IpcMainInvokeEvent): void {
-  if (
-    !safeModeManager ||
-    safeModeManager.isDestroyed() ||
-    event.sender !== safeModeManager.webContents ||
-    event.senderFrame !== safeModeManager.webContents.mainFrame
-  ) {
+  const host = safeModeManager && !safeModeManager.isDestroyed() ? safeModeManager.parent.webContents : undefined
+  if (!host || event.sender !== host || event.senderFrame !== host.mainFrame) {
     throw new Error('This action is only available from the Safe Mode manager.')
   }
 }
@@ -2445,7 +2499,8 @@ async function waitForSafeModeAction(options: {
   disabledPlugins: readonly string[]
   suspectedPlugins: readonly string[]
   issues: readonly ProfileCompatibilityIssue[]
-  healthReports?: readonly PluginHealthReport[]
+  /** The market check runs while the page is up; its result is pushed into the page. */
+  healthCheck?: Promise<readonly PluginHealthReport[] | undefined>
   backups: Awaited<ReturnType<typeof snapshotPluginRemovalLedger>>['backups']
   recoveryLocked: boolean
   backupRestoreLocked: boolean
@@ -2457,20 +2512,20 @@ async function waitForSafeModeAction(options: {
   const window = safeModeManager && !safeModeManager.isDestroyed()
     ? safeModeManager
     : (() => {
-      const manager = new SafeModeOverlay(parent, join(import.meta.dirname, '../preload/index.cjs'), () => {
+      const manager = new SafeModeFrame(parent, () => {
         if (safeModeManager === manager) safeModeManager = undefined
         resolveSafeModeAction({ type: 'agent' })
       })
       safeModeManager = manager
       return manager
     })()
-  const model = buildSafeModeViewModel({
+  const render = (health: { healthReports?: readonly PluginHealthReport[]; healthPending?: boolean }) => buildSafeModeViewModel({
     locale: harnessLocale(),
     plugins: options.plugins,
     disabledPlugins: options.disabledPlugins,
     suspectedPlugins: options.suspectedPlugins,
     issues: options.issues,
-    healthReports: options.healthReports,
+    ...health,
     backups: options.backups,
     recoveryLocked: options.recoveryLocked,
     backupRestoreLocked: options.backupRestoreLocked,
@@ -2481,24 +2536,23 @@ async function waitForSafeModeAction(options: {
   const actionPromise = new Promise<SafeModeAction>((resolve) => {
     safeModeActionResolver = resolve
   })
-  window.webContents.stop()
-  try {
-    await loadDesktopResource(window.webContents, desktopResourcePath('safe-mode.html'), {
-      query: {
-        state: JSON.stringify(model),
-        icon: app.isPackaged ? 'icon.png' : 'app-icon.png',
-        theme: harnessThemePreference()
-      }
-    })
-  } catch (error) {
-    safeModeActionResolver = undefined
-    throw error
-  }
   if (window.isDestroyed()) {
     return { type: 'quit' }
   }
-  window.show()
+  const seq = String(++safeModeLoadSequence)
+  window.show(desktopResourceUrl(SAFE_MODE_PAGE, {
+    state: JSON.stringify(render({ healthPending: options.healthCheck !== undefined })),
+    icon: app.isPackaged ? 'icon.png' : 'app-icon.png',
+    theme: harnessThemePreference(),
+    seq
+  }))
   raiseWindowWithoutStealingFocus(parent, process.platform, () => app.isActive())
+  // The page is up before the market check answers; the answer refreshes the
+  // page in place, unless the page has moved on to a later load.
+  void options.healthCheck?.then((healthReports) => {
+    if (!healthReports || window.isDestroyed() || String(safeModeLoadSequence) !== seq) return
+    window.applyUpdate({ seq, model: render({ healthReports }) })
+  })
   return actionPromise
 }
 
@@ -2735,23 +2789,25 @@ async function showSafeModeManager(initial?: {
       }
       const installed = [...new Set([...active, ...pendingRemovals])]
       const profileDisabled = recoveryLocked ? [] : await listDisabledProfilePlugins(dshHome, active)
-      let healthReports: PluginHealthReport[] | undefined
+      // Not awaited: the page opens right away and shows the result when it
+      // arrives. Only an upgrade needs the result before acting.
+      let healthCheck: Promise<PluginHealthReport[] | undefined> | undefined
       if (installed.length > 0 && !recoveryLocked) {
-        try {
-          const incompatiblePluginNames = compatibility.issues
-            .filter((issue) => issue.resolution === 'disable-plugin')
-            .map((issue) => issue.target)
-          healthReports = await checkupAllProfilePlugins({
-            plugins: installed,
-            dshHome,
-            bundledNodeModulesPath: join(app.getAppPath(), 'node_modules'),
-            incompatiblePlugins: [...new Set([...safeModeSuspectedPlugins, ...incompatiblePluginNames])],
-            fetchFn: (input, init) => net.fetch(input instanceof URL ? input.href : input, init),
-            locale: harnessLocale()
-          })
-        } catch (error) {
+        const incompatiblePluginNames = compatibility.issues
+          .filter((issue) => issue.resolution === 'disable-plugin')
+          .map((issue) => issue.target)
+        healthCheck = checkupAllProfilePlugins({
+          plugins: installed,
+          dshHome,
+          bundledNodeModulesPath: join(app.getAppPath(), 'node_modules'),
+          incompatiblePlugins: [...new Set([...safeModeSuspectedPlugins, ...incompatiblePluginNames])],
+          failureTtlMs: SAFE_MODE_MARKET_FAILURE_TTL_MS,
+          fetchFn: (input, init) => net.fetch(input instanceof URL ? input.href : input, init),
+          locale: harnessLocale()
+        }).catch((error: unknown) => {
           runtime.note(`[safe-mode] plugin market health checkup failed: ${String(error)}`)
-        }
+          return undefined
+        })
       }
 
       const allowedRestoreId = recoveryLocked &&
@@ -2771,7 +2827,7 @@ async function showSafeModeManager(initial?: {
         disabledPlugins: profileDisabled,
         suspectedPlugins: safeModeSuspectedPlugins,
         issues: compatibility.issues,
-        healthReports,
+        healthCheck,
         backups: removalBackups.backups,
         recoveryLocked,
         backupRestoreLocked,
@@ -2958,13 +3014,20 @@ async function showSafeModeManager(initial?: {
           )
         }
         await launchHarness()
-        if (await refreshMigrationRecoveryLock(dshHome)) {
-          notice = isChinese
-            ? 'Profile 恢复事务仍未完成。已继续保留恢复材料和安全模式；请按提示重试。'
-            : 'The Profile recovery transaction is still incomplete. Recovery material and Safe Mode remain active; follow the prompt and retry.'
+        const recoveryLocked = await refreshMigrationRecoveryLock(dshHome)
+        if (safeModeVisible || recoveryLocked) {
+          // launchHarness may re-enter repairable Safe Mode. Its queued manager
+          // is suppressed while this one is open, so keep this action loop alive
+          // and show the reason that manager would have shown.
+          const raised = pendingSafeModeNotice
+          pendingSafeModeNotice = undefined
+          notice = raised ?? (isChinese
+            ? '正常 Profile 仍未恢复，已继续保留安全模式。请检查启动日志并修复后重试。'
+            : 'The normal Profile is still unavailable. Safe Mode remains active; check the startup log, repair and retry.')
           noticeTone = 'error'
           continue
         }
+        pendingSafeModeNotice = undefined
         void mobileBridge.start().catch(showUnexpectedError)
         return
       }
@@ -2975,7 +3038,7 @@ async function showSafeModeManager(initial?: {
           noticeTone = 'error'
           continue
         }
-        const reportsByPkg = new Map((healthReports ?? []).map((r) => [r.packageName, r]))
+        const reportsByPkg = new Map(((await healthCheck) ?? []).map((r) => [r.packageName, r]))
         const targets = action.plugins.filter((pkg) => {
           const report = reportsByPkg.get(pkg)
           return report?.upgradeReady && report.upgradeVersion
@@ -3246,7 +3309,7 @@ async function showMobilePairing(): Promise<void> {
     return
   }
 
-  if (!snapshot.pairingUrl && !snapshot.tunnelActive) {
+  if (!snapshot.pairingUrl && !snapshot.tunnelActive && !snapshot.connected) {
     snapshot = await mobileBridge.toggleTunnel(true)
   }
 
@@ -3273,13 +3336,16 @@ async function showMobilePairing(): Promise<void> {
     mobileWindow = undefined
   })
   if (!snapshot.desktopUrl) return
-  await mobileWindow.loadURL(snapshot.desktopUrl)
+  const desktopUrl = mobileBridge.createDesktopUrl()
+  if (!desktopUrl) return
+  await mobileWindow.loadURL(desktopUrl)
   mobileWindow.show()
   mobileWindow.focus()
 }
 
 async function bootstrap(): Promise<void> {
   desktopDiagnostics?.startSending()
+  installDesktopProtocol(desktopResourcePath)
   if (process.platform === 'darwin') app.dock?.setIcon(desktopIconPath())
   launchDirectory = await ensureLaunchRoot(app.getPath('userData'))
   registerUpdateHandlers()
@@ -3347,9 +3413,16 @@ async function bootstrap(): Promise<void> {
     onReconnectRequested: () => {
       void showMobilePairing().catch(showUnexpectedError)
     },
-    onConnectedChange: (connected) => broadcastMobileStatus(connected)
+    onConnectedChange: (connected) => broadcastMobileStatus(connected),
+    pairingPinStore: createFilePairingPinStore(pairingPinStorePath(app.getPath('userData'))),
+    universalTokenStore: createFileUniversalTokenStore(universalTokenStorePath(app.getPath('userData')))
   })
   if (!startInSafeMode) void mobileBridge.start().catch(showUnexpectedError)
+
+  // Initialize remote harness manager
+  remoteHarnessManager = new RemoteHarnessManager(app.getPath('userData'))
+  await remoteHarnessManager.load()
+
   repairAgentService = new RepairAgentService({
     harnessUrl: () => runtime.snapshot().url,
     harnessAuthToken: () => runtime.snapshot().authToken,
@@ -3376,12 +3449,303 @@ async function bootstrap(): Promise<void> {
 
     const result = await dialog.showOpenDialog(mainWindow, {
       title: harnessLocale() === 'zh' ? '选择工作区目录' : 'Select Workspace Directory',
-      properties: ['openDirectory', 'createDirectory']
+      properties: ['openDirectory']
     })
     return result.canceled ? null : result.filePaths[0] ?? null
   })
   ipcMain.handle('mobile:open-pairing', () => showMobilePairing())
   ipcMain.handle('mobile:status', () => ({ connected: mobileBridge.snapshot().connected }))
+
+  // Remote Harness IPC handlers
+  ipcMain.handle('remote:list', () => {
+    return remoteHarnessManager?.list() ?? []
+  })
+
+  ipcMain.handle('remote:local-harness-url', () => {
+    const snapshot = runtime.snapshot()
+    if (!snapshot.url) return null
+    if (!snapshot.authToken) return snapshot.url
+    const url = new URL(snapshot.url)
+    url.searchParams.set('token', snapshot.authToken)
+    return url.toString()
+  })
+
+  ipcMain.handle('remote:add', async (_event, config: { name: string; pairingUrl: string }) => {
+    if (!remoteHarnessManager) throw new Error('Remote harness manager not initialized')
+
+    const parsed = RemoteHarnessManager.parsePairingUrl(config.pairingUrl)
+    if (!parsed) {
+      return { ok: false, error: 'Invalid pairing URL format' }
+    }
+
+    // Test connection by exchanging token for session cookie
+    let cookie: string | undefined
+    if (parsed.authToken) {
+      try {
+        // Try /pair?token=xxx first (mobile bridge endpoint)
+        const pairUrl = new URL('/pair', parsed.baseUrl)
+        pairUrl.searchParams.set('token', parsed.authToken)
+        const pairResponse = await fetch(pairUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(10_000)
+        })
+        let setCookie = pairResponse.headers.get('set-cookie')
+
+        // If /pair didn't work, try /?token=xxx (Harness root endpoint)
+        if (!setCookie) {
+          const exchangeUrl = new URL('/', parsed.baseUrl)
+          exchangeUrl.searchParams.set('token', parsed.authToken)
+          const response = await fetch(exchangeUrl, {
+            method: 'GET',
+            redirect: 'manual',
+            signal: AbortSignal.timeout(10_000)
+          })
+          setCookie = response.headers.get('set-cookie')
+        }
+
+        if (setCookie) {
+          const match = setCookie.match(/dsh_mobile=([^;]+)/)
+          if (match) {
+            cookie = `dsh_mobile=${match[1]}`
+          }
+        }
+      } catch (error) {
+        return { ok: false, error: `Connection failed: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+
+    if (!cookie) {
+      return { ok: false, error: 'Token exchange failed. The pairing link may be expired or already used.' }
+    }
+
+    // Test the connection with the cookie
+    try {
+      const statusResponse = await fetch(new URL('/api/status', parsed.baseUrl), {
+        method: 'GET',
+        headers: { cookie },
+        signal: AbortSignal.timeout(10_000)
+      })
+      if (!statusResponse.ok) {
+        return { ok: false, error: `Connection test failed: HTTP ${statusResponse.status}` }
+      }
+    } catch (error) {
+      return { ok: false, error: `Connection test failed: ${error instanceof Error ? error.message : String(error)}` }
+    }
+
+    // Fetch workspaces from remote via the bridge's /api/rpc
+    let workspaces: RemoteWorkspace[] = []
+    try {
+      const wsResponse = await fetch(new URL('/api/rpc', parsed.baseUrl), {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ method: 'workspace.list', payload: {} }),
+        signal: AbortSignal.timeout(10_000)
+      })
+      if (wsResponse.ok) {
+        const result = await wsResponse.json() as {
+          ok?: boolean
+          value?: { items?: Array<{
+            workspaceId?: string
+            title?: string
+            path?: string
+            sessionIds?: string[]
+          }> }
+        }
+        if (result.ok === true) {
+          workspaces = (result.value?.items ?? [])
+            .filter(w => typeof w.workspaceId === 'string')
+            .map(w => ({
+              workspaceId: w.workspaceId!,
+              title: w.title,
+              path: w.path,
+              sessionIds: w.sessionIds
+            }))
+        }
+      }
+    } catch (error) {
+      console.warn('[remote] failed to fetch workspaces:', error)
+    }
+
+    const remote = await remoteHarnessManager.add({
+      name: config.name,
+      baseUrl: parsed.baseUrl,
+      authToken: parsed.authToken,
+      sessionCookie: cookie,
+      workspaces
+    })
+
+    return { ok: true, remote }
+  })
+
+  ipcMain.handle('remote:remove', async (_event, id: string) => {
+    if (!remoteHarnessManager) throw new Error('Remote harness manager not initialized')
+    return remoteHarnessManager.remove(id)
+  })
+
+  ipcMain.handle('remote:test', async (_event, id: string) => {
+    if (!remoteHarnessManager) throw new Error('Remote harness manager not initialized')
+    const config = remoteHarnessManager.get(id)
+    if (!config) return { ok: false, error: 'Remote not found' }
+
+    // Use saved cookie if available, otherwise exchange token
+    let cookie = config.sessionCookie
+    if (!cookie && config.authToken) {
+      try {
+        const exchangeUrl = new URL('/', config.baseUrl)
+        exchangeUrl.searchParams.set('token', config.authToken)
+        const response = await fetch(exchangeUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(10_000)
+        })
+        const setCookie = response.headers.get('set-cookie')
+        if (setCookie) {
+          const match = setCookie.match(/dsh_mobile=([^;]+)/)
+          if (match) {
+            cookie = `dsh_mobile=${match[1]}`
+            // Save the new cookie
+            await remoteHarnessManager.update(id, { sessionCookie: cookie })
+          }
+        }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
+    }
+
+    if (!cookie) {
+      return { ok: false, error: 'No valid authentication. Please re-add the remote harness.' }
+    }
+
+    // Test with cookie
+    try {
+      const statusResponse = await fetch(new URL('/api/status', config.baseUrl), {
+        method: 'GET',
+        headers: { cookie },
+        signal: AbortSignal.timeout(10_000)
+      })
+      if (statusResponse.ok) {
+        await remoteHarnessManager.markConnected(id)
+        return { ok: true }
+      }
+      // Cookie might be expired, try re-exchange if we have a token
+      if (statusResponse.status === 401 && config.authToken) {
+        // Token is single-use, so we can't re-exchange
+        return { ok: false, error: 'Session expired. Please re-add the remote harness with a new pairing link.' }
+      }
+      return { ok: false, error: `HTTP ${statusResponse.status}` }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('remote:workspaces', async (_event, id: string) => {
+    if (!remoteHarnessManager) throw new Error('Remote harness manager not initialized')
+    const config = remoteHarnessManager.get(id)
+    if (!config) return { ok: false, error: 'Remote not found' }
+
+    // Use saved cookie or cached workspaces
+    const cookie = config.sessionCookie
+    if (!cookie) {
+      return { ok: false, error: 'Not authenticated. Please re-add the remote harness.' }
+    }
+
+    // Return cached workspaces if available
+    if (config.workspaces && config.workspaces.length > 0) {
+      return { ok: true, workspaces: config.workspaces }
+    }
+
+    // Fetch fresh workspaces via the bridge's /api/rpc
+    try {
+      const response = await fetch(new URL('/api/rpc', config.baseUrl), {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ method: 'workspace.list', payload: {} }),
+        signal: AbortSignal.timeout(10_000)
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        return { ok: false, error: `HTTP ${response.status}: ${text}` }
+      }
+      const result = await response.json() as {
+        ok?: boolean
+        value?: { items?: Array<{
+          workspaceId?: string
+          title?: string
+          path?: string
+          sessionIds?: string[]
+        }> }
+        error?: string
+      }
+      if (result.ok !== true) {
+        return { ok: false, error: result.error ?? 'RPC failed' }
+      }
+      const workspaces = (result.value?.items ?? [])
+        .filter(w => typeof w.workspaceId === 'string')
+        .map(w => ({
+          workspaceId: w.workspaceId!,
+          title: w.title,
+          path: w.path,
+          sessionIds: w.sessionIds
+        }))
+      // Cache the workspaces
+      await remoteHarnessManager.update(id, { workspaces })
+      return { ok: true, workspaces }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('remote:sessions', async (_event, id: string) => {
+    if (!remoteHarnessManager) throw new Error('Remote harness manager not initialized')
+    const config = remoteHarnessManager.get(id)
+    if (!config) return { ok: false, error: 'Remote not found' }
+
+    const cookie = config.sessionCookie
+    if (!cookie) {
+      return { ok: false, error: 'Not authenticated. Please re-add the remote harness.' }
+    }
+
+    try {
+      const response = await fetch(new URL('/api/rpc', config.baseUrl), {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ method: 'session.list', payload: {} }),
+        signal: AbortSignal.timeout(10_000)
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        return { ok: false, error: `HTTP ${response.status}: ${text}` }
+      }
+      const result = await response.json() as {
+        ok?: boolean
+        value?: { items?: Array<{
+          sessionId?: string
+          title?: string
+          updatedAt?: number
+          running?: boolean
+          blank?: boolean
+        }> }
+        error?: string
+      }
+      if (result.ok !== true) {
+        return { ok: false, error: result.error ?? 'RPC failed' }
+      }
+      const sessions = (result.value?.items ?? [])
+        .filter(s => typeof s.sessionId === 'string')
+        .map(s => ({
+          sessionId: s.sessionId!,
+          title: s.title,
+          updatedAt: s.updatedAt,
+          running: s.running,
+          blank: s.blank
+        }))
+      return { ok: true, sessions }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
   ipcMain.handle('harness:show-log', () => {
     shell.showItemInFolder(join(app.getPath('logs'), 'harness.log'))
   })
@@ -3513,6 +3877,13 @@ async function bootstrap(): Promise<void> {
     assertTrustedMainWindowEvent(event)
     return { active: safeModeVisible, locale: harnessLocale() }
   })
+  ipcMain.removeHandler('safe-mode:dismiss')
+  ipcMain.handle('safe-mode:dismiss', (event) => {
+    assertTrustedMainWindowEvent(event)
+    if (!safeModeVisible || !safeModeManagerVisible) return { ok: false }
+    resolveSafeModeAction({ type: 'agent' })
+    return { ok: true }
+  })
   ipcMain.removeHandler('safe-mode:manage')
   ipcMain.handle('safe-mode:manage', (event) => {
     assertTrustedMainWindowEvent(event)
@@ -3618,6 +3989,7 @@ if (isDaemonLaunch(process.env, process.platform)) {
         void openHarness(snapshot.url, 'user').catch(showUnexpectedError)
       }
     })
+    registerDesktopScheme()
     app.whenReady().then(bootstrap).catch((error: unknown) => {
       desktopDiagnostics?.startupFailed(error)
       showUnexpectedError(error)

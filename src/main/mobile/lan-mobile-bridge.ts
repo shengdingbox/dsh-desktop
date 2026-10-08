@@ -23,6 +23,7 @@ import {
   renderPairingPinPage
 } from './lan-mobile-pages'
 import type { PairingPinState, PairingPinStore } from './pairing-pin-store'
+import type { UniversalTokenStore } from './universal-token-store'
 
 const MAX_BODY_BYTES = 64 * 1024
 const PAIRING_TTL_MS = 5 * 60 * 1000
@@ -108,6 +109,7 @@ export interface LanMobileBridgeOptions {
   onReconnectRequested?: () => void
   onConnectedChange?: (connected: boolean) => void
   pairingPinStore?: PairingPinStore
+  universalTokenStore?: UniversalTokenStore
 }
 
 export interface LanMobileBridgeSnapshot {
@@ -203,6 +205,8 @@ export class LanMobileBridge {
 
   constructor(private readonly options: LanMobileBridgeOptions) {
     this.now = options.now ?? Date.now
+    const saved = options.universalTokenStore?.load().token
+    if (saved) this.universalToken = saved
   }
 
   createDesktopUrl(): string | undefined {
@@ -918,6 +922,7 @@ export class LanMobileBridge {
       if (!token) {
         // Clear the universal token.
         this.universalToken = undefined
+        this.options.universalTokenStore?.save({})
         return this.json(response, 200, { ok: true, universalToken: null })
       }
       // Validate token format: base64url-like, reasonable length.
@@ -925,6 +930,9 @@ export class LanMobileBridge {
         return this.json(response, 400, { ok: false, error: 'Token must be 8-128 characters of A-Z, a-z, 0-9, -, _' })
       }
       this.universalToken = token
+      if (!this.options.universalTokenStore?.save({ token })) {
+        return this.json(response, 500, { ok: false, error: 'Failed to persist the universal token.' })
+      }
       return this.json(response, 200, { ok: true, universalToken: token })
     }
 
