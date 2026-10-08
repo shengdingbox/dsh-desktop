@@ -11,6 +11,27 @@ export const name = 'dsh-desktop-workbenches'
 export const inject = ['connection']
 export const Config = Schema.object({ root: Schema.string().required() })
 
+export function catalogReadOptions(request) {
+  const params = new URL(request.url).searchParams
+  for (const key of params.keys()) {
+    if (key !== 'force') throw new CatalogError('Unsupported workbench catalog query.', 400)
+  }
+  const force = params.getAll('force')
+  if (force.length === 0) return { force: false }
+  if (force.length !== 1 || force[0] !== '1') throw new CatalogError('Invalid workbench catalog refresh request.', 400)
+  return { force: true }
+}
+
+export function authorizedStateMigrations(catalog) {
+  const allowed = new Map()
+  for (const entry of catalog.workbenches) {
+    for (const legacy of [entry.workbenchId, ...(entry.legacyWorkbenchIds || [])]) {
+      if (typeof legacy === 'string' && legacy !== entry.id) allowed.set(legacy, entry.id)
+    }
+  }
+  return allowed
+}
+
 async function readPayload(request, maximum = MAX_STATE_BYTES, tooLarge = 'Workbench state is too large.') {
   const contentLength = Number(request.headers.get('content-length'))
   if (Number.isFinite(contentLength) && contentLength > maximum) throw new StateError(tooLarge, 413)
@@ -68,9 +89,9 @@ export function apply(ctx, config) {
     path: '/api/desktop-workbenches/catalog',
     methods: ['GET'],
     requestBody: 'buffered',
-    async fetch() {
+    async fetch(request) {
       try {
-        const result = await readCatalog()
+        const result = await readCatalog(catalogReadOptions(request))
         return Response.json(result, { headers: { 'cache-control': 'no-store' } })
       } catch (error) {
         return Response.json({ error: error instanceof CatalogError ? error.message : 'Could not read the workbench catalog.' }, {
@@ -117,10 +138,7 @@ export function apply(ctx, config) {
       try {
         const payload = await readPayload(request)
         if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !payload.migrations || typeof payload.migrations !== 'object' || Array.isArray(payload.migrations)) throw new StateError('A workbench ID migration is required.')
-        const allowed = new Map()
-        for (const entry of (await readCatalog()).catalog.workbenches) {
-          for (const legacy of entry.legacyWorkbenchIds || []) allowed.set(legacy, entry.workbenchId)
-        }
+        const allowed = authorizedStateMigrations((await readCatalog()).catalog)
         if (!Object.entries(payload.migrations).length || !Object.entries(payload.migrations).every(([from, to]) => allowed.get(from) === to)) throw new StateError('This workbench ID migration is not authorized by the market.', 403)
         return Response.json(await store.migrate({ revision: payload.revision, state: payload.state }, payload.migrations), { headers: { 'cache-control': 'no-store' } })
       } catch (error) { return stateFailure(error) }
@@ -186,18 +204,7 @@ export function apply(ctx, config) {
             } catch (error) { throw new MarketInstallError(error instanceof Error ? error.message : String(error), 409) }
             await awaitHandle(handle)
           } finally { await target.cleanup() }
-          // The catalog owns the stable runtime ID. This makes attribution
-          // independent of package-local manifests and available immediately.
-          const workbenchId = entry.workbenchId
-          try {
-            const clash = Object.entries(await marketInstalls.read()).find(([key, value]) => key !== id && value.workbenchId === workbenchId)
-            if (clash) throw new MarketInstallError(`This package registers workbench ID "${workbenchId}", which ${clash[0]} already uses.`, 409)
-          } catch (error) {
-            // Never leave a package enabled that Desktop cannot attribute.
-            await awaitHandle(ctx.desktopPnpm.runPlugin(['remove', target.expectedPluginName], config.root)).catch(() => {})
-            throw error
-          }
-          const install = { catalogId: entry.id, workbenchId, pluginName: target.expectedPluginName, version: entry.version, source: entry.distribution.type, installedAt: new Date().toISOString() }
+          const install = { catalogId: entry.id, pluginName: target.expectedPluginName, version: entry.version, source: entry.distribution.type, installedAt: new Date().toISOString() }
           await marketInstalls.record(id, install)
           return Response.json({ install, restartRequired: true }, { headers: { 'cache-control': 'no-store' } })
         } catch (error) { return installFailure(error, 'Could not install the workbench.') }
@@ -213,7 +220,7 @@ export function apply(ctx, config) {
           const install = (await marketInstalls.read())[id]
           if (!install) throw new MarketInstallError('This workbench was not installed from the workbench market.', 404)
           let handle
-          try { handle = ctx.desktopPnpm.runPlugin(['remove', install.pluginName], config.root) }
+          try { handle = ctx.desktopPnpm.removeWorkbenchGeneration(install.pluginName, config.root) }
           catch (error) { throw new MarketInstallError(error instanceof Error ? error.message : String(error), 409) }
           await awaitHandle(handle)
           await marketInstalls.forget(id)

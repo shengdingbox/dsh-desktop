@@ -9,7 +9,7 @@ export class CatalogError extends Error {
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value)
 const text = value => typeof value === 'string' && value.trim() !== ''
-const workbenchId = value => typeof value === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(value)
+const legacyWorkbenchId = value => typeof value === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(value)
 const httpsUrl = value => {
   if (!text(value)) return false
   try { return new URL(value).protocol === 'https:' } catch { return false }
@@ -30,33 +30,33 @@ export function validatePublishedCatalog(value) {
   }
 
   const ids = new Set()
-  const workbenchIds = new Set()
-  const legacyWorkbenchIds = new Set()
+  const legacyIds = new Map()
   for (const entry of value.workbenches) {
-    if (!object(entry) || !text(entry.id) || ids.has(entry.id) || !workbenchId(entry.workbenchId) || workbenchIds.has(entry.workbenchId) || !text(entry.owner) || !text(entry.repository)
+    if (!object(entry) || !text(entry.id) || ids.has(entry.id) || !text(entry.owner) || !text(entry.repository)
       || !httpsUrl(entry.url) || !text(entry.name) || !categories.has(entry.category)
       || !object(entry.description) || !text(entry.description.zh) || !text(entry.description.en)
       || !text(entry.version) || !text(entry.license) || !object(entry.distribution)
       || !['npm', 'github-release', 'github-source'].includes(entry.distribution.type)
       || !text(entry.distribution.version) || entry.distribution.version !== entry.version
+      || (entry.workbenchId !== undefined && !legacyWorkbenchId(entry.workbenchId))
+      || (entry.legacyWorkbenchIds !== undefined && (!Array.isArray(entry.legacyWorkbenchIds)
+        || !entry.legacyWorkbenchIds.every(legacyWorkbenchId) || new Set(entry.legacyWorkbenchIds).size !== entry.legacyWorkbenchIds.length))
       || !Array.isArray(entry.screenshots) || entry.screenshots.length < 1) {
       fail('Invalid workbench catalog entry.')
     }
-    if (entry.legacyWorkbenchIds !== undefined && (!Array.isArray(entry.legacyWorkbenchIds) || !entry.legacyWorkbenchIds.length
-      || !entry.legacyWorkbenchIds.every(workbenchId) || new Set(entry.legacyWorkbenchIds).size !== entry.legacyWorkbenchIds.length
-      || entry.legacyWorkbenchIds.includes(entry.workbenchId) || entry.legacyWorkbenchIds.some(id => legacyWorkbenchIds.has(id) || workbenchIds.has(id)))) {
-      fail('Invalid workbench catalog legacy identities.')
-    }
     const repositoryId = `${entry.owner}/${entry.repository}`.toLowerCase()
     if (entry.id !== repositoryId || entry.url.toLowerCase() !== `https://github.com/${repositoryId}`) fail('Invalid workbench catalog identity.')
+    for (const legacy of [entry.workbenchId, ...(entry.legacyWorkbenchIds || [])]) {
+      if (legacy === undefined) continue
+      if (legacyIds.has(legacy) && legacyIds.get(legacy) !== entry.id) fail('Duplicate workbench catalog legacy identity.')
+      legacyIds.set(legacy, entry.id)
+    }
     if (!entry.screenshots.every(image => object(image) && httpsUrl(image.url) && text(image.alt) && /^[a-f0-9]{64}$/.test(image.sha256)
       && Number.isSafeInteger(image.width) && image.width > 0 && Number.isSafeInteger(image.height) && image.height > 0
       && Number.isSafeInteger(image.bytes) && image.bytes > 0)) {
       fail('Invalid workbench catalog screenshot.')
     }
     ids.add(entry.id)
-    workbenchIds.add(entry.workbenchId)
-    for (const id of entry.legacyWorkbenchIds || []) legacyWorkbenchIds.add(id)
   }
   return structuredClone(value)
 }
@@ -84,8 +84,8 @@ export function createCatalogReader({ fetch: fetchCatalog = globalThis.fetch, ur
     } finally { clearTimeout(timeout) }
   }
 
-  return async function readCatalog() {
-    if (cached && now() - fetchedAt < CACHE_MAX_AGE_MS) return { catalog: structuredClone(cached), stale: false }
+  return async function readCatalog({ force = false } = {}) {
+    if (!force && cached && now() - fetchedAt < CACHE_MAX_AGE_MS) return { catalog: structuredClone(cached), stale: false }
     if (!pending) pending = fetchFresh().finally(() => { pending = undefined })
     try { return await pending } catch (error) {
       if (cached) return { catalog: structuredClone(cached), stale: true }

@@ -6,7 +6,7 @@ const projectRoot = path.resolve(import.meta.dirname, '..')
 
 describe('DSH Desktop sidebar branding', () => {
 
-  it('keeps Harness 0.1.6 platform-aware collapsed titlebar spacing', async () => {
+  it('uses upstream platform-aware collapsed titlebar spacing', async () => {
     const client = await readFile(
       path.join(projectRoot, 'node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js'),
       'utf8'

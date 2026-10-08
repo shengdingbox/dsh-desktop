@@ -10,7 +10,8 @@ window.__ModuleLoader__.load({
     const { Button, Modal, IconGlobeOutline14 } = require('@deepseek-ai/dsh-client-ui-primitives')
 
     const NS = 'desktop-onboarding'
-    // Bump to re-show the notice to users who acknowledged an older release.
+    // Retained as the acknowledgement payload for settings compatibility.
+    // Eligibility is install-scoped; changing this value never re-prompts.
     const WIZARD_VERSION = '2026-09-21.1'
     // Settings section the "configure a model" action opens.
     const MODELS_SECTION_ID = 'models'
@@ -166,12 +167,17 @@ window.__ModuleLoader__.load({
     // so the user leaves through one of the two explicit actions.
     const ignoreImplicitDismiss = () => {}
 
+    function onboardingDecision(value) {
+      const acknowledged = typeof value?.wizardVersion === 'string' && value.wizardVersion.length > 0
+      return value?.eligible === true && !acknowledged ? 'show' : 'complete'
+    }
+
     // ---------- the first-run notice ----------
 
     function DesktopOnboardingNotice(props) {
       const { complete, openSection, t } = props
       const wizardScope = props.controller.scope
-      const [acked, setAcked] = useState(null) // null=loading, true, false
+      const [decision, setDecision] = useState('loading')
       const titleRef = useRef(null)
       const finishedRef = useRef(false)
 
@@ -196,9 +202,8 @@ window.__ModuleLoader__.load({
           const snap = wizardScope.getSnapshot()
           // Wait for the Host section so returning users never see a flash.
           if (snap.mode !== 'memory' && snap.status === 'loading') return
-          // Exact-version comparison: bumping WIZARD_VERSION re-prompts users
-          // who acknowledged an older release.
-          setAcked(snap.mode !== 'memory' && snap.value?.wizardVersion === WIZARD_VERSION)
+          const value = snap.value ?? {}
+          setDecision(onboardingDecision(value))
         }
         let unsubscribe
         try {
@@ -210,15 +215,15 @@ window.__ModuleLoader__.load({
         return () => { if (unsubscribe) unsubscribe() }
       }, [wizardScope])
 
-      // Returning users who already acknowledged this version skip straight on.
+      // Ineligible installs and every prior acknowledgement skip straight on.
       useEffect(() => {
-        if (acked === true && !finishedRef.current) {
+        if (decision === 'complete' && !finishedRef.current) {
           finishedRef.current = true
           complete()
         }
-      }, [acked, complete])
+      }, [decision, complete])
 
-      const visible = acked === false
+      const visible = decision === 'show'
 
       // Keep the application behind the dialog inert, like the stock notice.
       useEffect(() => {
@@ -281,37 +286,36 @@ window.__ModuleLoader__.load({
     // ---------- composition ----------
 
     function apply(ctx) {
-      installStyles()
-      const t = ctx.locale.bind(NS)
+      ctx.inject(['slots', 'locale', 'settingsScope'], (scope) => {
+        installStyles()
+        const t = scope.locale.bind(NS)
 
-      const wizardScope = ctx.settingsScope.bind({
-        namespace: NS,
-        decode: (value) => (typeof value === 'object' && value !== null && !Array.isArray(value) ? value : {})
+        const wizardScope = scope.settingsScope.bind({
+          namespace: NS,
+          decode: (value) => (typeof value === 'object' && value !== null && !Array.isArray(value) ? value : {})
+        })
+
+        scope.locale.register(NS, { zh, en })
+
+        const controller = { scope: wizardScope }
+
+        // The stock welcome-notice / official-DeepSeek onboarding entries are
+        // removed upstream by the settings-models patch (the desktop notice owns
+        // first-run), so this notice registers under its own id — no shadowing.
+        scope.slots.inject('settings.onboarding', () => scope.slots.register({
+          name: 'settings.onboarding',
+          id: 'dsh-desktop-onboarding',
+          order: 0,
+          inject: () => ({ controller, t })
+        }, DesktopOnboardingNotice))
       })
-
-      ctx.locale.register(NS, { zh, en })
-
-      const controller = { scope: wizardScope }
-
-      // The stock welcome-notice / official-DeepSeek onboarding entries are
-      // removed upstream by the settings-models patch (the desktop notice owns
-      // first-run), so this notice registers under its own id — no shadowing.
-      ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
-        name: 'settings.onboarding',
-        id: 'dsh-desktop-onboarding',
-        order: 0,
-        inject: () => ({ controller, t })
-      }, DesktopOnboardingNotice))
     }
 
-    const inject = [
-      'slots',
-      'locale',
-      'settingsScope'
-    ]
+    const inject = []
 
     exports.apply = apply
     exports.inject = inject
+    exports.onboardingDecision = onboardingDecision
     return module.exports
   }
 })

@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { AvailableRelease, UpdateStatus } from '../shared/contracts'
 import { setupDesktopStoragePersistence } from './desktop-storage'
 import {
@@ -9,8 +9,22 @@ import {
 } from './update-view'
 import { isPluginLoadError } from './plugin-error-view'
 import { findBootFailureText } from './boot-failure'
-import { mountWindowsTitlebarLayout } from './windows-titlebar'
-import { mountRemoteHarnessButton } from './remote-harness-view'
+import { markWindowsTitlebar, mountWindowsTitlebarLayout } from './windows-titlebar'
+import { mountMacosWindowChrome } from './macos-window-chrome'
+import { createHostPathsBridge, HOST_PATHS_BRIDGE } from './host-paths'
+
+if (process.platform === 'darwin') {
+  const dispose = mountMacosWindowChrome(document, listener => {
+    const receive = (_event: Electron.IpcRendererEvent, value: unknown): void => {
+      if (typeof value === 'boolean') listener(value)
+    }
+    ipcRenderer.on('dsh-desktop:window-fullscreen', receive)
+    return () => ipcRenderer.removeListener('dsh-desktop:window-fullscreen', receive)
+  })
+  window.addEventListener('unload', dispose, { once: true })
+}
+
+if (process.platform === 'win32') markWindowsTitlebar(document)
 
 // Intercept and persist localStorage to disk storage before any page script executes
 setupDesktopStoragePersistence()
@@ -138,7 +152,6 @@ function runDomSync(): void {
   positionSafeModeFrame()
   placeSafeModeBanner()
   mountMobileButton()
-  mountRemoteHarnessButton()
   if (bootScanSettled) return
   // The boot screen only exists until Harness renders its own UI, and the
   // sidebar appearing is that moment. Past it the selector can never match
@@ -150,9 +163,14 @@ function runDomSync(): void {
   } else checkBootFailureInDom()
 }
 
-contextBridge.exposeInMainWorld('dshDesktopDirectoryPicker', {
+contextBridge.exposeInMainWorld('__DSH_DIRECTORY_PICKER__', {
   pick: (): Promise<string | null> => ipcRenderer.invoke('directory-picker:open')
 })
+
+contextBridge.exposeInMainWorld(
+  HOST_PATHS_BRIDGE,
+  createHostPathsBridge(file => webUtils.getPathForFile(file))
+)
 
 /**
  * `[data-dsh-*]` lookups are attribute selectors with no index behind them, so
@@ -368,7 +386,6 @@ function initializeUi(): void {
   mount()
   mountAbout()
   mountMobileButton()
-  mountRemoteHarnessButton()
   checkBootFailureInDom()
   domObserver.observe(document.documentElement, {
     childList: true,
@@ -552,20 +569,12 @@ contextBridge.exposeInMainWorld(
   'dshDesktop',
   Object.freeze({
     restartHarness: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('harness:restart'),
+    getBuiltInImageGenerationStatus: (): Promise<{ enabled: boolean; marketActive: boolean }> =>
+      ipcRenderer.invoke('desktop-host-plugin:status'),
+    setBuiltInImageGenerationEnabled: (enabled: boolean): Promise<{ ok: boolean; enabled?: boolean; restartRequired?: boolean; reason?: string }> =>
+      ipcRenderer.invoke('desktop-host-plugin:set-enabled', enabled),
     uninstallMarket: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('market:uninstall'),
     openInFinder: (path: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('harness:open-in-finder', path)
-  })
-)
-
-contextBridge.exposeInMainWorld(
-  'dshRemoteHarness',
-  Object.freeze({
-    list: () => ipcRenderer.invoke('remote:list'),
-    add: (config: { name: string; pairingUrl: string }) => ipcRenderer.invoke('remote:add', config),
-    remove: (id: string) => ipcRenderer.invoke('remote:remove', id),
-    test: (id: string) => ipcRenderer.invoke('remote:test', id),
-    workspaces: (id: string) => ipcRenderer.invoke('remote:workspaces', id),
-    sessions: (id: string) => ipcRenderer.invoke('remote:sessions', id)
   })
 )
 
@@ -582,7 +591,6 @@ contextBridge.exposeInMainWorld(
     action: (action: string): Promise<{ ok: boolean }> => ipcRenderer.invoke('web-import:action', action)
   })
 )
-
 
 function mount(): void {
   if (document.getElementById(ROOT_ID)) return

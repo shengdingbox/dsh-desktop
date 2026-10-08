@@ -1,9 +1,12 @@
 import { readFileSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import vm from 'node:vm'
 import { describe, expect, it, vi } from 'vitest'
 import { patchPath, projectRoot } from './patch-path'
+// @ts-expect-error Local host plugins are authored as ESM JavaScript.
+import { Config as HostConfig, apply as applyHost } from '../packages/dsh-desktop-onboarding/index.js'
 
 interface Registration {
   config: {
@@ -17,6 +20,7 @@ interface Registration {
 }
 
 interface CtxHarness {
+  inject: (deps: string[], callback: (scope: CtxHarness) => unknown) => unknown
   effect: (fn: () => unknown | (() => void)) => () => void
   locale: {
     register: (ns: string, dicts: Record<string, Record<string, string>>) => void
@@ -110,6 +114,7 @@ function loadPlugin() {
     factory: (require: (id: string) => unknown) => {
       apply: (ctx: CtxHarness) => void
       inject: string[]
+      onboardingDecision: (value: unknown) => 'show' | 'complete'
     }
   } | undefined
   const appended: Array<{ id?: string; textContent?: string }> = []
@@ -164,6 +169,7 @@ function createCtx(overrides: Partial<CtxHarness> = {}): { ctx: CtxHarness; regi
   }
   const noopEffect = () => () => undefined
   const ctx: CtxHarness = {
+    inject: (_deps, callback) => callback(ctx),
     effect: noopEffect,
     locale: {
       register: () => undefined,
@@ -214,7 +220,7 @@ describe('DSH Desktop onboarding wizard', () => {
     const { ctx, registrations } = createCtx()
     plugin.apply(ctx)
 
-    expect(plugin.inject).toEqual(['slots', 'locale', 'settingsScope'])
+    expect(plugin.inject).toEqual([])
     const onboardingRegistrations = registrations.filter(({ config }) => config.name === 'settings.onboarding')
     expect(onboardingRegistrations).toHaveLength(1)
     const [onboardingRegistration] = onboardingRegistrations
@@ -252,6 +258,19 @@ describe('DSH Desktop onboarding wizard', () => {
     expect(en.configureModel).toBeTruthy()
     expect(en.later).toBeTruthy()
   })
+
+  it('shows only an eligible install with no acknowledgement', () => {
+    const { plugin } = loadPlugin()
+    expect(plugin.onboardingDecision({ eligible: true })).toBe('show')
+    expect(plugin.onboardingDecision({ eligible: false })).toBe('complete')
+    expect(plugin.onboardingDecision({})).toBe('complete')
+  })
+
+  it('treats every non-empty wizard version as acknowledgement', () => {
+    const { plugin } = loadPlugin()
+    expect(plugin.onboardingDecision({ eligible: true, wizardVersion: 'old-version' })).toBe('complete')
+    expect(plugin.onboardingDecision({ eligible: true, wizardVersion: '  ' })).toBe('complete')
+  })
 })
 
 describe('DSH Desktop onboarding composition', () => {
@@ -284,8 +303,92 @@ describe('DSH Desktop onboarding composition', () => {
     expect(parsed.dependencies?.['dsh-desktop-onboarding']).toBe('file:packages/dsh-desktop-onboarding')
   })
 
+  it('declares the renderer that provides its slots service as a direct client dependency', async () => {
+    const manifest = await readFile(
+      path.join(projectRoot, 'packages', 'dsh-desktop-onboarding', 'package.json'),
+      'utf8'
+    )
+    const parsed = JSON.parse(manifest) as { dsh?: { client?: { inject?: string[] } } }
+    expect(parsed.dsh?.client?.inject).toContain('@deepseek-ai/dsh-client-ui-renderer')
+  })
+
   it('is reachable from the @deepseek-ai/dsh dependency closure', async () => {
     const dshPatch = await readFile(patchPath('@deepseek-ai/dsh'), 'utf8')
     expect(dshPatch).toContain('+    "dsh-desktop-onboarding": "0.1.0",')
+  })
+})
+
+describe('DSH Desktop onboarding host eligibility', () => {
+  function createHostHarness() {
+    const configure = vi.fn(() => () => undefined)
+    const fiber = { uid: 1 }
+    return {
+      configure,
+      fiber,
+      ctx: {
+        fiber,
+        inject: (_deps: string[], callback: (ctx: unknown) => void) => callback({
+          effect: (effect: () => unknown) => effect(),
+          // Reproduce the Cordis proxy symptom from the packaged Harness: the
+          // legacy name is present but is not callable. The 0.1.7 integration
+          // must not read it at all.
+          settings: { register: { shadowed: true }, configure }
+        })
+      }
+    }
+  }
+
+  it('publishes eligible only for a valid new-install marker', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'dsh-onboarding-host-'))
+    const previous = process.env.DSH_HOME
+    try {
+      process.env.DSH_HOME = root
+      await writeFile(path.join(root, '.desktop-install-state.json'), JSON.stringify({
+        schemaVersion: 1,
+        classification: 'new',
+        firstSeenVersion: '1.0.0',
+        classifiedAt: '2026-09-23T00:00:00.000Z'
+      }))
+      const first = createHostHarness()
+      const firstConfig = { eligible: false }
+      applyHost(first.ctx, firstConfig)
+      expect(firstConfig.eligible).toBe(true)
+      expect(first.configure).toHaveBeenCalledWith({ auto: false }, first.fiber)
+
+      await writeFile(path.join(root, '.desktop-install-state.json'), '{broken')
+      const brokenConfig = { eligible: true }
+      applyHost(createHostHarness().ctx, brokenConfig)
+      expect(brokenConfig.eligible).toBe(false)
+
+      await writeFile(path.join(root, '.desktop-install-state.json'), JSON.stringify({
+        schemaVersion: 1,
+        classification: 'existing',
+        firstSeenVersion: '1.0.0',
+        classifiedAt: '2026-09-23T00:00:00.000Z'
+      }))
+      const existingConfig = { eligible: true }
+      applyHost(createHostHarness().ctx, existingConfig)
+      expect(existingConfig.eligible).toBe(false)
+
+      await rm(path.join(root, '.desktop-install-state.json'))
+      const missingConfig = { eligible: true }
+      applyHost(createHostHarness().ctx, missingConfig)
+      expect(missingConfig.eligible).toBe(false)
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previous
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('publishes both onboarding fields through the Harness 0.1.7 Config schema', () => {
+    const json = HostConfig.toJSON() as {
+      uid: number
+      refs: Record<string, { dict?: Record<string, number>; meta?: Record<string, unknown> }>
+    }
+    const root = json.refs[String(json.uid)]
+    expect(Object.keys(root?.dict ?? {}).sort()).toEqual(['eligible', 'wizardVersion'])
+    expect(json.refs[String(root?.dict?.eligible)]?.meta?.volatile).toBe(true)
+    expect(json.refs[String(root?.dict?.wizardVersion)]?.meta?.volatile).toBe(true)
   })
 })
